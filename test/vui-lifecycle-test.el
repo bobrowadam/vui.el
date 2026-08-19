@@ -47,6 +47,37 @@
                     '(mount-cleanup effect-cleanup)))
         (kill-buffer "*test-unmount-cleanups*"))))
 
+  (it "runs every effect cleanup before re-signaling the first error"
+    (let ((signaling-cleanups 0)
+          (later-cleanups 0))
+      (vui-defcomponent unmount-cleanup-error ()
+        :render
+        (progn
+          ;; Effects are cleaned up in reverse registration order, so this
+          ;; signaling cleanup runs before the other registered cleanup.
+          (vui-use-effect ()
+            (lambda () (cl-incf later-cleanups)))
+          (vui-use-effect ()
+            (lambda ()
+              (cl-incf signaling-cleanups)
+              (error "effect cleanup failed")))
+          (vui-text "x")))
+      (let ((instance (vui-mount (vui-component 'unmount-cleanup-error)
+                                 "*test-unmount-cleanup-error*")))
+        (unwind-protect
+            (progn
+              (expect (vui-unmount instance) :to-throw 'error)
+              (expect signaling-cleanups :to-equal 1)
+              (expect later-cleanups :to-equal 1)
+              (expect (vui-instance-effects instance) :to-be nil)
+              ;; The failed first teardown left the root attached.  Its
+              ;; recovery teardown must not run either cleanup a second time.
+              (vui-unmount instance)
+              (expect signaling-cleanups :to-equal 1)
+              (expect later-cleanups :to-equal 1))
+          (when (get-buffer "*test-unmount-cleanup-error*")
+            (kill-buffer "*test-unmount-cleanup-error*"))))))
+
   (it "cancels a pending deferred re-render"
     (let ((vui-render-delay 0.01)
           (render-count 0))

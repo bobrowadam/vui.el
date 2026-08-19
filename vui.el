@@ -2235,14 +2235,26 @@ Called from within a component's render function."
                         (assq-delete-all effect-id effects)))))))))
 
 (defun vui--cleanup-instance-effects (instance)
-  "Run all cleanup functions for INSTANCE's effects."
-  (dolist (effect-entry (vui-instance-effects instance))
-    (let ((cleanup (cadr (cdr effect-entry))))
-      (when (functionp cleanup)
-        ;; Bind context for consistency (cleanup may call vui-set-state)
-        (let ((vui--current-instance instance))
-          (funcall cleanup)))))
-  (setf (vui-instance-effects instance) nil))
+  "Run all cleanup functions for INSTANCE's effects.
+
+Clear the registered effects before invoking user cleanup functions, run every
+cleanup even if one signals, then re-signal the first error.  Clearing first
+ensures recovery teardown cannot invoke a failed cleanup again."
+  (let ((effects (vui-instance-effects instance))
+        first-error)
+    (setf (vui-instance-effects instance) nil)
+    (dolist (effect-entry effects)
+      (let ((cleanup (cadr (cdr effect-entry))))
+        (when (functionp cleanup)
+          ;; Bind context for consistency (cleanup may call vui-set-state).
+          (condition-case err
+              (let ((vui--current-instance instance))
+                (funcall cleanup))
+            (error
+             (unless first-error
+               (setq first-error err)))))))
+    (when first-error
+      (signal (car first-error) (cdr first-error)))))
 
 ;;; Refs System
 
@@ -6054,6 +6066,260 @@ content-only and no-op on a component node for now."
         (push node (vui-stream-handle-nodes handle))
         node))))
 
+(defun vui--stream-tail-shape (vtree)
+  "Return (HANDLE SUFFIX) for VTREE's plain stream-tail shape, or nil.
+
+The stream must be the first non-nil child and the only stream.  A fragment
+or an unindented, unfaced, keymap-free vstack is eligible; liveness and
+nonemptiness are deliberately checked separately by `vui--stream-tail-eligible'."
+  (let ((children
+         (cond ((vui-vnode-fragment-p vtree) (vui-vnode-fragment-children vtree))
+               ((and (vui-vnode-vstack-p vtree)
+                     (= 0 (or (vui-vnode-vstack-indent vtree) 0))
+                     (null (vui-vnode-vstack-face vtree))
+                     (null (vui-vnode-vstack-keymap vtree)))
+                (vui-vnode-vstack-children vtree))
+               (t :no))))
+    (when (listp children)
+      (let ((cs (remq nil children)))
+        (when (and cs (vui-vnode-stream-p (car cs))
+                   (not (cl-some #'vui-vnode-stream-p (cdr cs))))
+          (list (vui-vnode-stream-handle (car cs)) (cdr cs)))))))
+
+(defun vui--stream-open-row-validate (handle vnode)
+  "Validate HANDLE and component VNODE for `vui-stream-open-row'."
+  (unless (vui-stream-handle-p handle)
+    (error "HANDLE is not a vui stream"))
+  (unless (vui-vnode-component-p vnode)
+    (error "VNODE is not a vui component"))
+  ;; Resolve the definition before changing the stream, so an unknown
+  ;; component cannot leave a bootstrap item behind.
+  (vui--get-component (vui-vnode-component-type vnode))
+  (when vui--rendering-p
+    (error "vui-stream-open-row cannot run during VUI rendering"))
+  (let ((buffer (vui-stream-handle-buffer handle))
+        (start (vui-stream-handle-region-start handle))
+        (end (vui-stream-handle-region-end handle)))
+    (unless (and (buffer-live-p buffer)
+                 start (marker-position start)
+                 end (marker-position end))
+      (error "HANDLE is not a mounted, live vui stream"))
+    (let ((root (vui-get-instance buffer)))
+      (unless root
+        (error "HANDLE is not a mounted, live vui stream"))
+      ;; Stateful inline rows survive future root commits only through the
+      ;; stream-tail patch.  Reuse its committed root tree shape rather than
+      ;; attempting a broader reconciliation here.
+      (unless (eq handle
+                  (car (vui--stream-tail-shape
+                        (vui-instance-cached-vtree root))))
+        (error (concat "vui-stream-open-row requires HANDLE to be the first "
+                       "stream in its root's plain stream-tail layout"))))))
+
+(defun vui--stream-open-row-settle-root (root)
+  "Synchronously settle ROOT's timer and current batch work.
+
+This is called only after `vui-stream-open-row' has rejected active rendering,
+so each `vui-flush-sync' starts a top-level render rather than queueing a
+recursive one.  A render may itself request another batched update, so settle
+until this root has neither a timer nor an outstanding batch render."
+  (when vui--rendering-p
+    (error "vui-stream-open-row cannot run during VUI rendering"))
+  (let ((iterations 0))
+    (while (or (vui-instance-render-timer root)
+               (and (> vui--batch-depth 0) vui--render-pending-p))
+      (when (> (cl-incf iterations) vui--rerender-queue-limit)
+        (error "VUI stream-row pending work did not settle after %d iterations"
+               vui--rerender-queue-limit))
+      ;; `vui-flush-sync' cancels a scheduled timer.  Batched changes have no
+      ;; timer yet, so consume their established pending flag before flushing.
+      (when (and (> vui--batch-depth 0) vui--render-pending-p)
+        (setq vui--render-pending-p nil))
+      (let ((vui--root-instance root))
+        (vui-flush-sync)))))
+
+(defun vui--stream-open-row-snapshot (handle)
+  "Return the mutable HANDLE state needed to roll back an open-row attempt."
+  (let ((end (vui-stream-handle-region-end handle))
+        (last-start (vui-stream-handle-last-start handle)))
+    (list :items (vui-stream-handle-items-rev handle)
+          :nodes (copy-sequence (vui-stream-handle-nodes handle))
+          :region-end end
+          :region-end-position (and end (marker-position end))
+          :last-start last-start
+          :last-start-position (and last-start (marker-position last-start)))))
+
+(defun vui--stream-open-row-restore (handle snapshot)
+  "Restore HANDLE from SNAPSHOT after a failed open-row transaction."
+  (let ((buffer (vui-stream-handle-buffer handle))
+        (end (plist-get snapshot :region-end))
+        (last-start (plist-get snapshot :last-start)))
+    (setf (vui-stream-handle-items-rev handle) (plist-get snapshot :items)
+          (vui-stream-handle-nodes handle) (plist-get snapshot :nodes)
+          (vui-stream-handle-region-end handle) end
+          (vui-stream-handle-last-start handle) last-start)
+    (when end
+      (set-marker end (plist-get snapshot :region-end-position) buffer))
+    (when last-start
+      (set-marker last-start (plist-get snapshot :last-start-position) buffer))))
+
+(defun vui--stream-open-row-discard-inline (instances)
+  "Remove failed inline INSTANCES without masking their original error."
+  (dolist (instance instances)
+    ;; Prefer VUI's normal teardown.  If a user lifecycle callback signals,
+    ;; finish only its physical residue; effect registrations were cleared
+    ;; before their callbacks ran, so this cannot invoke a failed cleanup
+    ;; twice.
+    (condition-case nil
+        (vui--unmount-inline instance)
+      (error
+       (let ((buffer (vui-instance-buffer instance))
+             (start (vui-instance-region-start instance))
+             (end (vui-instance-region-end instance)))
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (setq vui--inline-instances (delq instance vui--inline-instances))
+             (vui--stream-open-row-delete-region buffer start end)))
+         (when start (set-marker start nil))
+         (when end (set-marker end nil))
+         (setf (vui-instance-region-start instance) nil
+               (vui-instance-region-end instance) nil)
+         (ignore-errors (vui--cleanup-instance-asyncs instance))
+         (vui--detach-instance instance))))))
+
+(defun vui--stream-open-row-delete-region (buffer start end)
+  "Delete BUFFER's managed region between START and END markers."
+  (when (and (buffer-live-p buffer)
+             start (marker-position start) end (marker-position end))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t)
+            (inhibit-modification-hooks t)
+            (buffer-undo-list t)
+            (from (marker-position start))
+            (to (marker-position end)))
+        (vui--remove-widget-overlays from to)
+        (vui--forget-region-fields from to)
+        (delete-region from to)))))
+
+(defun vui--stream-open-row-live-instance-p (instance buffer)
+  "Return non-nil when INSTANCE owns nonempty inline output in BUFFER."
+  (let ((start (and instance (vui-instance-region-start instance)))
+        (end (and instance (vui-instance-region-end instance))))
+    (and (vui--inline-p instance)
+         (eq (vui-instance-buffer instance) buffer)
+         start end (marker-position start) (marker-position end)
+         (< (marker-position start) (marker-position end)))))
+
+(defun vui-stream-open-row (handle vnode)
+  "Append component VNODE as an inline row and return its live stream node.
+
+HANDLE must be a mounted, live `vui-stream-handle', and VNODE must be a
+`vui-component'.  Call this outside VUI rendering.  The returned node owns a
+genuine nonempty inline component instance, including when HANDLE is empty,
+so it can be passed to `vui-stream-update' immediately.  HANDLE must be the
+first stream in the root's plain stream-tail layout (a fragment or unindented,
+unfaced, keymap-free vstack with no other stream), which is the commit path
+that preserves inline rows.  Unsupported placement and initially empty output
+are rejected without changing the stream.
+
+Opening an empty stream uses a private non-component sentinel to settle the
+supported parent layout.  VNODE is mounted exactly once with
+`vui-mount-inline'; it is never rendered through `vui-stream-open'\='s
+empty-stream fallback."
+  (vui--stream-open-row-validate handle vnode)
+  (let ((buffer (vui-stream-handle-buffer handle)))
+    ;; A pending root render or timerless batch can otherwise leave the cached
+    ;; tree stale, admitting a row that the pending root commit will destroy.
+    (with-current-buffer buffer
+      (vui--stream-open-row-settle-root vui--root-instance))
+    (vui--stream-open-row-validate handle vnode)
+    (let* ((snapshot (vui--stream-open-row-snapshot handle))
+           (old-inline (with-current-buffer buffer
+                         (copy-sequence vui--inline-instances)))
+           (items (vui-stream-handle-items-rev handle))
+           ;; A legacy opened empty content node is still an empty stream for
+           ;; this strict row API: only a visible region can own a normal row.
+           (empty-p (vui--stream-region-empty-p handle))
+           ;; `vui--stream-render' reuses this marker for the sentinel region.
+           ;; The row replaces that ownership on success, so it must not stay
+           ;; attached as an untracked buffer marker.
+           (bootstrap-end (and empty-p (vui-stream-handle-region-end handle)))
+           ;; This type-t marker captures exactly the text inserted by a
+           ;; normal nonempty-stream row attempt, before any static suffix.
+           (transaction-start
+            (and (not empty-p)
+                 (copy-marker (marker-position
+                               (vui-stream-handle-region-end handle)) nil)))
+           (transaction-end
+            (and transaction-start
+                 (copy-marker (marker-position transaction-start) t)))
+           node)
+      (unwind-protect
+          (condition-case err
+              (progn
+            (if empty-p
+                ;; The sentinel forces the root to emit the stream and its
+                ;; parent separator without ever rendering the requested
+                ;; component through the legacy fallback.
+                (let* ((sentinel (vui-text "\u200b"))
+                       (root (vui-get-instance buffer)))
+                  (push sentinel (vui-stream-handle-items-rev handle))
+                  (vui-rerender root)
+                  (let* ((start (vui-stream-handle-region-start handle))
+                         (end (vui-stream-handle-region-end handle))
+                         (position (and start (marker-position start))))
+                    (unless (and position end (marker-position end)
+                                 (< position (marker-position end)))
+                      (error "Could not establish inline stream-row layout"))
+                    ;; Delete the private content-only bootstrap region.  An
+                    ;; empty legacy item renders no text, so this never deletes
+                    ;; a live component region or earns a separator.
+                    (vui--stream-open-row-delete-region buffer start end)
+                    (let ((row (with-current-buffer buffer
+                                 (vui-mount-inline vnode position))))
+                      (unless (vui--stream-open-row-live-instance-p row buffer)
+                        (error "vui-stream-open-row rejects an initially empty component"))
+                      (setf (vui-stream-handle-items-rev handle) (cons row items)
+                            (vui-stream-handle-region-end handle)
+                            (vui-instance-region-end row))
+                      (when bootstrap-end
+                        (set-marker bootstrap-end nil))
+                      (vui--stream-set-last-start handle position buffer)
+                      (setq node (vui--stream-node-create
+                                  :handle handle
+                                  :cell (vui-stream-handle-items-rev handle)
+                                  :instance row))
+                      (push node (vui-stream-handle-nodes handle)))))
+              ;; A visibly nonempty stream takes the existing fast path.  The
+              ;; postcondition prevents this strict API from claiming legacy
+              ;; fallback ownership if the stream was not genuinely live.
+              (progn
+                (unless (not (vui--stream-region-empty-p handle))
+                  (error "vui-stream-open-row requires an empty or visibly nonempty stream"))
+                (setq node (vui-stream-open handle vnode))
+                (unless (vui--stream-open-row-live-instance-p
+                         (vui--stream-node-instance node) buffer)
+                  (error "Could not establish inline stream-row ownership"))))
+                node)
+            (error
+             (let ((new-inline
+                    (with-current-buffer buffer
+                      (cl-set-difference vui--inline-instances old-inline :test #'eq))))
+               (vui--stream-open-row-discard-inline new-inline))
+             (if empty-p
+                 ;; The sentinel was the only rendered stream item, so restoring
+                 ;; the original empty model and re-laying it restores layout.
+                 (progn
+                   (vui--stream-open-row-restore handle snapshot)
+                   (with-current-buffer buffer
+                     (vui-rerender (vui-get-instance buffer))))
+               (vui--stream-open-row-delete-region
+                buffer transaction-start transaction-end)
+               (vui--stream-open-row-restore handle snapshot))
+             (signal (car err) (cdr err))))
+        (when transaction-start (set-marker transaction-start nil))
+        (when transaction-end (set-marker transaction-end nil))))))
+
 (defun vui-stream-append-to (node vnode)
   "Append VNODE's content at the end of live NODE's region; return NODE.
 The streaming primitive: each delta costs O(delta) - only the new text is
@@ -6315,32 +6581,17 @@ if NODE is not live."
          (and s (marker-position s) e (marker-position e)))))
 
 (defun vui--stream-tail-eligible (vtree)
-  "Return (HANDLE SUFFIX) when VTREE is a flat container whose first child
-is a live stream and no other child is a stream; else nil.  SUFFIX is the
-list of vnodes after the stream.  Only plain (indent 0, no face/keymap)
-vstacks and fragments qualify."
-  (let ((children
-         (cond ((vui-vnode-fragment-p vtree) (vui-vnode-fragment-children vtree))
-               ((and (vui-vnode-vstack-p vtree)
-                     (= 0 (or (vui-vnode-vstack-indent vtree) 0))
-                     (null (vui-vnode-vstack-face vtree))
-                     (null (vui-vnode-vstack-keymap vtree)))
-                (vui-vnode-vstack-children vtree))
-               (t :no))))
-    (when (listp children)
-      (let ((cs (remq nil children)))
-        (when (and cs (vui-vnode-stream-p (car cs))
-                   (not (cl-some #'vui-vnode-stream-p (cdr cs))))
-          (let ((h (vui-vnode-stream-handle (car cs))))
-            (when (and (vui--stream-live-p h)
-                       ;; The stream must be NON-EMPTY.  The patch leaves the
-                       ;; stream region untouched; for an empty stream that
-                       ;; means the first appended item (which re-renders via
-                       ;; this path) would never be emitted.  Stay wholesale
-                       ;; until there is content; then patch.
-                       (/= (marker-position (vui-stream-handle-region-start h))
-                           (marker-position (vui-stream-handle-region-end h))))
-              (list h (cdr cs)))))))))
+  "Return (HANDLE SUFFIX) when VTREE's stream-tail shape is live and nonempty.
+
+`vui--stream-tail-shape' recognizes the supported root placement; this adds
+only the state required to leave that stream region untouched during a commit."
+  (when-let* ((shape (vui--stream-tail-shape vtree))
+              (handle (car shape))
+              ((vui--stream-live-p handle))
+              (start (vui-stream-handle-region-start handle))
+              (end (vui-stream-handle-region-end handle))
+              ((/= (marker-position start) (marker-position end))))
+    shape))
 
 (defun vui--render-children-as (vtree children)
   "Render CHILDREN as a container shaped like VTREE; return chars written.

@@ -17,7 +17,15 @@ and borne out in the build: no, *if* finalized nodes drop their markers.
 addressable by ref, updated out of order with =vui-stream-update= (props
 refresh, state preserved); such a node carries no markers of its own (the
 row owns them), so =finalize= just stops tracking it and the row stays
-interactive. Still to come: node-owned separators and the section tree.
+interactive. =vui-stream-open-row= is the strict component-row variant: it
+finishes a private non-component empty-stream bootstrap before returning, so
+its node always owns a genuine nonempty inline row. It is available only when
+the stream is the first child of the root's plain stream-tail container
+(fragment, or unindented/unfaced/keymap-free vstack, with no other stream),
+the existing commit path that preserves inline rows across root refreshes. It
+settles that root's pending timer or batched update before validating its
+placement, and rejects unsupported placement and initially empty component
+output atomically.  Still to come: node-owned separators and the section tree.
 
 * Problem
 
@@ -175,6 +183,7 @@ ends, dropping its marker and keeping append flat forever.
 #+begin_src elisp
 (vui-stream-append    handle vnode)        ; static, O(1), fire-and-forget (logs, done msgs)
 (vui-stream-open      handle vnode) -> node ; live: returns a ref you keep
+(vui-stream-open-row  handle component-vnode) -> node ; guaranteed inline row
 (vui-stream-append-to node vnode)          ; append content to a live node (O(delta)) - streaming
 (vui-stream-update    node vnode)          ; replace a live node's whole region
 (vui-stream-finalize  node)                ; live -> static, release the marker
@@ -201,9 +210,15 @@ the natural behaviour of =append-to=.
   its life: append is O(interactive rows). Fine for a chat (tens-hundreds of
   rows = tens of us); not for 100k live widgets - that is virtualization, a
   separate problem. As implemented, =vui-stream-open= of a component returns a
-  node that wraps the inline row; =vui-stream-update= refreshes its props out
-  of order (state preserved); =finalize= just stops tracking the node (the row
-  keeps its own markers and stays interactive). =append-to= / =before= /
+  node that wraps the inline row when the stream already has content; its
+  empty-stream fallback remains for compatibility. =vui-stream-open-row=
+  guarantees the nonempty inline-row form only in the root's supported plain
+  stream-tail placement (stream first; no other stream), using a private
+  content sentinel rather than rendering its requested component through that
+  fallback; it rejects unsupported placement and initially empty output.
+  =vui-stream-update= refreshes row props
+  out of order (state preserved); =finalize= just stops tracking the node (the
+  row keeps its own markers and stays interactive). =append-to= / =before= /
   =after= / =remove= are content-only for now and no-op on a component node.
   (Today's component-rows code already has the latent O(rows)-per-append cost;
   the node model makes it addressable.)

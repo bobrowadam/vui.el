@@ -49,6 +49,39 @@
 (defun vui-snode--kill ()
   (when (get-buffer "*vui-snode*") (kill-buffer "*vui-snode*")))
 
+(defun vui-snode--empty-stream-state (stream)
+  "Capture STREAM's empty-state ownership and rendered layout."
+  (let ((start (vui-stream-handle-region-start stream))
+        (end (vui-stream-handle-region-end stream))
+        (last-start (vui-stream-handle-last-start stream)))
+    (list :items (vui-stream-handle-items-rev stream)
+          :nodes (vui-stream-handle-nodes stream)
+          :inline (with-current-buffer "*vui-snode*"
+                    vui--inline-instances)
+          :start start :start-position (marker-position start)
+          :end end :end-position (marker-position end)
+          :last-start last-start
+          :last-start-position (and last-start (marker-position last-start))
+          :text (vui-snode--buffer))))
+
+(defun vui-snode--expect-empty-stream-state (stream state)
+  "Assert STREAM still has the captured empty STATE."
+  (expect (vui-stream-handle-items-rev stream) :to-be (plist-get state :items))
+  (expect (vui-stream-handle-nodes stream) :to-equal (plist-get state :nodes))
+  (expect (with-current-buffer "*vui-snode*" vui--inline-instances)
+          :to-equal (plist-get state :inline))
+  (expect (vui-stream-handle-region-start stream) :to-be (plist-get state :start))
+  (expect (marker-position (vui-stream-handle-region-start stream))
+          :to-equal (plist-get state :start-position))
+  (expect (vui-stream-handle-region-end stream) :to-be (plist-get state :end))
+  (expect (marker-position (vui-stream-handle-region-end stream))
+          :to-equal (plist-get state :end-position))
+  (expect (vui-stream-handle-last-start stream) :to-be (plist-get state :last-start))
+  (expect (and (vui-stream-handle-last-start stream)
+               (marker-position (vui-stream-handle-last-start stream)))
+          :to-equal (plist-get state :last-start-position))
+  (expect (vui-snode--buffer) :to-equal (plist-get state :text)))
+
 (describe "vui-stream nodes: streaming into one ref"
   (it "append-to grows a node, byte-identical to the accumulated text"
     (let ((vui-render-delay nil)
@@ -368,6 +401,35 @@
   "A trivial row that renders its LABEL, for component-node tests."
   :render (vui-text (format "[%s]" label)))
 
+(vui-defcomponent vui-snode-open-row-during-render (stream)
+  "Attempt `vui-stream-open-row' during render for its rejection test."
+  :render
+  (vui-stream-open-row stream (vui-component 'vui-snode-row :label "bad")))
+
+(vui-defcomponent vui-snode-indented-app (stream)
+  "Place STREAM in a layout that cannot preserve inline rows on root refresh."
+  :render (vui-vstack :indent 2 (vui-stream stream)))
+
+(vui-defcomponent vui-snode-batched-layout-app (stream)
+  "Switch STREAM from an eligible root layout to an ineligible one."
+  :state ((indented nil))
+  :render
+  (if indented
+      (vui-vstack :indent 2 (vui-stream stream))
+    (vui-vstack (vui-stream stream))))
+
+(defvar vui-snode--failing-cleanup-count 0)
+
+(vui-defcomponent vui-snode-failing-cleanup-row ()
+  "Render empty after registering a cleanup that signals."
+  :render
+  (progn
+    (vui-use-effect ()
+      (lambda ()
+        (cl-incf vui-snode--failing-cleanup-count)
+        (error "failing cleanup")))
+    (vui-fragment)))
+
 (describe "vui-stream nodes: component nodes (open a row)"
   (it "opens a component vnode as a live row node"
     (let ((vui-render-delay nil)
@@ -433,9 +495,294 @@
                     :to-equal (vui-snode--oracle '("header" "[a]") "n0")))
         (vui-snode--kill))))
 
-  ;; Opening a component on an EMPTY stream takes the row fallback (no inline
-  ;; instance): the node must NOT capture the root instance, and a later
-  ;; update must not hijack the buffer.
+  (it "open-row bootstraps an empty stream into an owned inline row"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream)))
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (let ((node (vui-stream-open-row
+                       s (vui-component 'vui-snode-row :label "solo"))))
+            (expect (vui--inline-p (vui--stream-node-instance node)) :to-be t)
+            (expect (vui-snode--buffer)
+                    :to-equal (vui-snode--oracle '("[solo]") "n0"))
+            ;; The row is stable before `open-row' returns.
+            (vui-stream-update node (vui-component 'vui-snode-row :label "updated"))
+            (expect (vui-snode--buffer)
+                    :to-equal (vui-snode--oracle '("[updated]") "n0")))
+        (vui-snode--kill))))
+
+  (it "preserves and updates an empty-stream row after an eligible root refresh"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream)))
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (let* ((root (vui-get-instance "*vui-snode*"))
+                 (node (vui-stream-open-row
+                        s (vui-component 'vui-snode-row :label "before")))
+                 (row (vui--stream-node-instance node)))
+            (vui-update root (list :stream s :note "n1"))
+            (expect (vui--stream-node-instance node) :to-be row)
+            (expect (vui-snode--buffer)
+                    :to-equal (vui-snode--oracle '("[before]") "n1"))
+            (vui-stream-update node (vui-component 'vui-snode-row :label "after"))
+            (expect (vui-snode--buffer)
+                    :to-equal (vui-snode--oracle '("[after]") "n1")))
+        (vui-snode--kill))))
+
+  (it "rejects a stream outside the root stream-tail layout before mutation"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream))
+          (buffer "*vui-snode-indented*"))
+      (vui-mount (vui-component 'vui-snode-indented-app :stream s) buffer)
+      (unwind-protect
+          (let ((before (with-current-buffer buffer (buffer-string))))
+            (expect (vui-stream-open-row
+                     s (vui-component 'vui-snode-row :label "bad"))
+                    :to-throw 'error)
+            (expect (vui-stream-handle-items-rev s) :to-be nil)
+            (with-current-buffer buffer
+              (expect vui--inline-instances :to-be nil)
+              (expect (buffer-string) :to-equal before)))
+        (when (get-buffer buffer) (kill-buffer buffer)))))
+
+  (it "replaces a legacy zero-width node without extra separators"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream)))
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (progn
+            ;; This is the legacy `vui-stream-open' empty-content shape that
+            ;; used to force Mentat's mutable-text promotion workaround.
+            (vui-stream-open s (vui-text ""))
+            (let ((bootstrap-end (vui-stream-handle-region-end s))
+                  (node (vui-stream-open-row
+                         s (vui-component 'vui-snode-row :label "row"))))
+              (expect (marker-buffer bootstrap-end) :to-be nil)
+              (vui-stream-append s (vui-text "tail"))
+              (vui-update (vui-get-instance "*vui-snode*")
+                          (list :stream s :note "n1"))
+              (vui-stream-update node (vui-component 'vui-snode-row :label "updated"))
+              (expect (vui-snode--buffer)
+                      :to-equal
+                      (vui-snode--oracle '("[updated]" "tail") "n1"))))
+        (vui-snode--kill))))
+
+  (it "releases nonempty transaction markers after success and failure"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream)))
+      (vui-defcomponent vui-snode-transaction-error ()
+        :render (error "transaction render failed"))
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (progn
+            (vui-stream-append s (vui-text "header"))
+            (let ((original (symbol-function 'copy-marker))
+                  markers)
+              (cl-letf (((symbol-function 'copy-marker)
+                         (lambda (&optional marker-or-integer insertion-type)
+                           (let ((marker (funcall original marker-or-integer
+                                                  insertion-type)))
+                             (push marker markers)
+                             marker))))
+                (vui-stream-open-row s (vui-component 'vui-snode-row :label "ok")))
+              (expect (length markers) :to-equal 2)
+              (expect (cl-every (lambda (marker) (not (marker-buffer marker)))
+                                markers)
+                      :to-be t))
+            (let ((original (symbol-function 'copy-marker))
+                  markers)
+              (cl-letf (((symbol-function 'copy-marker)
+                         (lambda (&optional marker-or-integer insertion-type)
+                           (let ((marker (funcall original marker-or-integer
+                                                  insertion-type)))
+                             (push marker markers)
+                             marker))))
+                (expect (vui-stream-open-row
+                         s (vui-component 'vui-snode-transaction-error))
+                        :to-throw 'error))
+              (expect (length markers) :to-equal 2)
+              (expect (cl-every (lambda (marker) (not (marker-buffer marker)))
+                                markers)
+                      :to-be t)))
+        (vui-snode--kill))))
+
+  (it "mounts the empty-stream component exactly once until teardown"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream))
+          (initializations 0)
+          (renders 0)
+          (mounts 0)
+          (effects 0)
+          (cleanups 0)
+          (unmounts 0))
+      (vui-defcomponent vui-snode-single-mount ()
+        :state ((count (progn (cl-incf initializations) 0)))
+        :on-mount (cl-incf mounts)
+        :on-unmount (cl-incf unmounts)
+        :render (progn
+                  (cl-incf renders)
+                  (vui-use-effect ()
+                    (cl-incf effects)
+                    (lambda () (cl-incf cleanups)))
+                  (vui-text (format "[%d]" count))))
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (let* ((node (vui-stream-open-row
+                        s (vui-component 'vui-snode-single-mount)))
+                 (row (vui--stream-node-instance node)))
+            (expect initializations :to-equal 1)
+            (expect renders :to-equal 1)
+            (expect mounts :to-equal 1)
+            (expect effects :to-equal 1)
+            (expect cleanups :to-equal 0)
+            (expect unmounts :to-equal 0)
+            (vui-stream-update node (vui-component 'vui-snode-single-mount))
+            (expect initializations :to-equal 1)
+            (expect mounts :to-equal 1)
+            (expect cleanups :to-equal 0)
+            (expect unmounts :to-equal 0)
+            (vui-unmount row)
+            (expect cleanups :to-equal 1)
+            (expect unmounts :to-equal 1))
+        (vui-snode--kill))))
+
+  (it "open-row settles a pending root render before returning"
+    (let ((vui-render-delay 60)
+          (s (vui-make-stream)))
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (let ((root (vui-get-instance "*vui-snode*")))
+            (vui--schedule-deferred-render-for root)
+            (expect (vui-instance-render-timer root) :not :to-be nil)
+            (let ((node (vui-stream-open-row
+                         s (vui-component 'vui-snode-row :label "ready"))))
+              (expect (vui--inline-p (vui--stream-node-instance node)) :to-be t)
+              (expect (vui-instance-render-timer root) :to-be nil)
+              (expect (vui-snode--buffer)
+                      :to-equal (vui-snode--oracle '("[ready]") "n0"))))
+        (vui-snode--kill))))
+
+  (it "open-row settles a timerless batch before revalidating its root layout"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream)))
+      (let ((root (vui-mount
+                   (vui-component 'vui-snode-batched-layout-app :stream s)
+                   "*vui-snode*")))
+        (unwind-protect
+            (with-current-buffer "*vui-snode*"
+              (let ((vui--current-instance root)
+                    (vui--root-instance root))
+                (vui-batch
+                 (vui-set-state :indented t)
+                 (expect vui--render-pending-p :to-be t)
+                 (let ((state (vui-snode--empty-stream-state s)))
+                   (expect (vui-stream-open-row
+                            s (vui-component 'vui-snode-row :label "stale"))
+                           :to-throw 'error)
+                   (expect vui--render-pending-p :to-be nil)
+                   (vui-snode--expect-empty-stream-state s state)))))
+          (vui-snode--kill)))))
+
+  (it "open-row rejects an invalid vnode without changing the stream"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream)))
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (let ((state (vui-snode--empty-stream-state s)))
+            (expect (vui-stream-open-row s (vui-text "not a component"))
+                    :to-throw 'error)
+            (vui-snode--expect-empty-stream-state s state))
+        (vui-snode--kill))))
+
+  (it "rolls back initializer and render errors atomically"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream)))
+      (vui-defcomponent vui-snode-init-error ()
+        :state ((value (error "initializer failed")))
+        :render (vui-text "unreachable"))
+      (vui-defcomponent vui-snode-render-error ()
+        :render (error "render failed"))
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (dolist (component '(vui-snode-init-error vui-snode-render-error))
+            (let ((state (vui-snode--empty-stream-state s)))
+              (expect (vui-stream-open-row s (vui-component component))
+                      :to-throw 'error)
+              (vui-snode--expect-empty-stream-state s state)))
+        (vui-snode--kill))))
+
+  (it "rejects an initially empty component and rolls back"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream)))
+      (vui-defcomponent vui-snode-empty-row ()
+        :render (vui-fragment))
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (let ((state (vui-snode--empty-stream-state s)))
+            (expect (vui-stream-open-row s (vui-component 'vui-snode-empty-row))
+                    :to-throw 'error)
+            (vui-snode--expect-empty-stream-state s state))
+        (vui-snode--kill))))
+
+  (it "runs a failing effect cleanup once and leaves no row residue"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream)))
+      (setq vui-snode--failing-cleanup-count 0)
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (let ((state (vui-snode--empty-stream-state s)))
+            (condition-case err
+                (vui-stream-open-row s (vui-component 'vui-snode-failing-cleanup-row))
+              (error
+               (expect (error-message-string err)
+                       :to-match "rejects an initially empty component")))
+            (expect vui-snode--failing-cleanup-count :to-equal 1)
+            (vui-snode--expect-empty-stream-state s state))
+        (vui-snode--kill))))
+
+  (it "rolls back a failed row mount after a nonempty stream"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream)))
+      (vui-defcomponent vui-snode-nonempty-render-error ()
+        :render (error "nonempty render failed"))
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (progn
+            (vui-stream-append s (vui-text "header"))
+            (let ((items (vui-stream-handle-items-rev s))
+                  (nodes (vui-stream-handle-nodes s))
+                  (inline (with-current-buffer "*vui-snode*" vui--inline-instances))
+                  (end (vui-stream-handle-region-end s))
+                  (end-position (marker-position (vui-stream-handle-region-end s)))
+                  (text (vui-snode--buffer)))
+              (expect (vui-stream-open-row
+                       s (vui-component 'vui-snode-nonempty-render-error))
+                      :to-throw 'error)
+              (expect (vui-stream-handle-items-rev s) :to-be items)
+              (expect (vui-stream-handle-nodes s) :to-equal nodes)
+              (expect (with-current-buffer "*vui-snode*" vui--inline-instances)
+                      :to-equal inline)
+              (expect (vui-stream-handle-region-end s) :to-be end)
+              (expect (marker-position (vui-stream-handle-region-end s))
+                      :to-equal end-position)
+              (expect (vui-snode--buffer) :to-equal text)))
+        (vui-snode--kill))))
+
+  (it "open-row rejects calls during VUI rendering without changing the stream"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream)))
+      (unwind-protect
+          (progn
+            (expect (vui-mount
+                     (vui-component 'vui-snode-open-row-during-render :stream s)
+                     "*vui-snode-render-row*")
+                    :to-throw 'error)
+            (expect (vui-stream-handle-items-rev s) :to-be nil))
+        (when (get-buffer "*vui-snode-render-row*")
+          (kill-buffer "*vui-snode-render-row*")))))
+
+  ;; `vui-stream-open' intentionally retains its empty-stream fallback
+  ;; contract: it does not claim an inline row.
   (it "open of a component on an empty stream does not capture the root"
     (let ((vui-render-delay nil)
           (s (vui-make-stream)))

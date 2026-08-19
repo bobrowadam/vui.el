@@ -171,6 +171,17 @@ The format is based on [[https://keepachangelog.com/en/1.1.0/][Keep a Changelog]
   engine where sensible, so the conformance comparison explored in
   yibie/textui#1 stays meaningful.
 
+- =vui-stream-open-row= mounts a stateful component row with immediate,
+  independently updateable inline ownership even when its stream is empty,
+  provided the stream is first in the root's plain stream-tail layout.  Its
+  private content sentinel settles that supported parent layout without
+  rendering the requested component through the legacy empty-stream fallback.
+  Before its final layout check it synchronously settles this root's pending
+  timer or batched update, so a stale eligible tree cannot admit a row that the
+  pending commit would destroy.  Unsupported layouts, failed initialization,
+  rendering, mounting, or initially empty output leave the original stream and
+  buffer state unchanged.
+
 * v1.4.0 - 2026-08-18
 
 ** Added
