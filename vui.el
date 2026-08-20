@@ -2846,19 +2846,24 @@ mid-render."
 The host buffer outside the region is left untouched.  Region
 mutations are kept out of the undo history: the rendered UI is
 ephemeral chrome, not document content."
-  (let ((buffer (vui-instance-buffer instance))
-        (start (vui-instance-region-start instance))
-        (end (vui-instance-region-end instance)))
-    (when (and buffer (buffer-live-p buffer)
-               start (marker-position start))
+  (let* ((buffer (vui-instance-buffer instance))
+         (start (vui-instance-region-start instance))
+         (end (vui-instance-region-end instance))
+         (pos (and (markerp start) (marker-position start)))
+         (end-pos (and (markerp end) (marker-position end))))
+    (when (and buffer (buffer-live-p buffer))
+      (unless (and pos end-pos
+                   (eq (marker-buffer start) buffer)
+                   (eq (marker-buffer end) buffer))
+        (error "Cannot re-render inline VUI instance with invalid region"))
+      (when (< end-pos pos)
+        (error "Cannot re-render inline VUI instance with reversed region"))
       (with-current-buffer buffer
         (let* ((inhibit-read-only t)
                (inhibit-redisplay t)
                (inhibit-modification-hooks t)
                ;; Managed UI text is not part of the document's history
                (buffer-undo-list t)
-               (pos (marker-position start))
-               (end-pos (marker-position end))
                ;; Only track the cursor when it is inside the region;
                ;; positions outside adjust automatically
                (cursor-info (when (and (>= (point) pos)
@@ -2866,7 +2871,11 @@ ephemeral chrome, not document content."
                               (vui--save-cursor-position pos end-pos)))
                (vui--root-instance instance)
                (vui--render-path nil)
-               (vui--pending-effects nil))
+               (vui--pending-effects nil)
+               ;; Track sequential output independently of ambient point,
+               ;; which lifecycle code may move before this render returns.
+               ;; With no output, the marker remains at POS.
+               (render-end (copy-marker pos t)))
           ;; Queue re-render requests until commit and effects are done
           (setq vui--rendering-p t)
           (unwind-protect
@@ -2882,7 +2891,7 @@ ephemeral chrome, not document content."
                   ;; own insertions (so user edits stay outside), put
                   ;; it back at the region's beginning
                   (set-marker start pos)
-                  (set-marker end (point))
+                  (set-marker end (marker-position render-end))
                   (widget-setup)
                   (vui--setup-field-placeholders))
                 (when cursor-info
@@ -2890,6 +2899,7 @@ ephemeral chrome, not document content."
                                                 (marker-position end)))
                 ;; Run effects after commit
                 (vui--run-pending-effects))
+            (set-marker render-end nil)
             (setq vui--rendering-p nil))))
       ;; Run any re-renders requested during render/effects
       (vui--flush-queued-rerenders))))

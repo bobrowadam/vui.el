@@ -445,6 +445,104 @@
                     :to-equal (vui-snode--oracle '("header" "[a]") "n0")))
         (vui-snode--kill))))
 
+  (it "tracks inline output when rendering leaves point before the row"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream)))
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (progn
+            (vui-stream-append s (vui-text "header"))
+            (let* ((node (vui-stream-open-row
+                          s (vui-component 'vui-snode-row :label "old")))
+                   (row (vui--stream-node-instance node))
+                   (start (vui-instance-region-start row))
+                   (end (vui-instance-region-end row))
+                   (stream-end (vui-stream-handle-region-end s))
+                   (replacement "[replacement]"))
+              ;; Keep static text on both sides of the managed row so a stale
+              ;; duplicate or an escaped edit is visible in the final string.
+              (with-current-buffer "*vui-snode*"
+                (let ((inhibit-read-only t)
+                      (inhibit-modification-hooks t)
+                      (buffer-undo-list t))
+                  (goto-char (point-min))
+                  (insert "static-before|")
+                  (goto-char (point-max))
+                  (insert "|static-after")))
+              (let ((start-position (marker-position start))
+                    (original-copy-marker (symbol-function 'copy-marker))
+                    render-end)
+                (expect stream-end :to-be end)
+                (cl-letf (((symbol-function 'copy-marker)
+                           (lambda (&optional marker type)
+                             (let ((copy (funcall original-copy-marker
+                                                  marker type)))
+                               (when (and (null render-end)
+                                          type
+                                          (equal marker start-position))
+                                 (setq render-end copy))
+                               copy)))
+                          ((symbol-function 'vui--render-instance)
+                           (lambda (&rest _)
+                             (insert replacement)
+                             ;; The captured failure rendered the row at POS,
+                             ;; then returned normally with ambient point
+                             ;; before POS.
+                             (goto-char (- start-position 2)))))
+                  (expect (vui-rerender row) :not :to-throw))
+                (expect (vui-snode--buffer)
+                        :to-equal
+                        (concat "static-before|"
+                                (vui-snode--oracle
+                                 (list "header" replacement) "n0")
+                                "|static-after"))
+                (expect (vui-instance-region-start row) :to-be start)
+                (expect (vui-instance-region-end row) :to-be end)
+                (expect (vui-stream-handle-region-end s) :to-be stream-end)
+                (expect stream-end :to-be end)
+                (expect (marker-position start) :to-equal start-position)
+                (expect (marker-position end)
+                        :to-equal (+ start-position (length replacement)))
+                (expect (<= (marker-position start) (marker-position end))
+                        :to-be t)
+                (expect render-end :not :to-be nil)
+                (expect (marker-position render-end) :to-be nil)
+                ;; A normal later update must replace the same range, not
+                ;; leave the captured replacement as a stale duplicate.
+                (vui-stream-update
+                 node (vui-component 'vui-snode-row :label "new"))
+                (expect (vui-snode--buffer)
+                        :to-equal
+                        (concat "static-before|"
+                                (vui-snode--oracle '("header" "[new]") "n0")
+                                "|static-after")))))
+        (vui-snode--kill))))
+
+  (it "rejects an inline instance with a reversed region before mutation"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream)))
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (progn
+            (vui-stream-append s (vui-text "header"))
+            (let* ((node (vui-stream-open-row
+                          s (vui-component 'vui-snode-row :label "old")))
+                   (row (vui--stream-node-instance node))
+                   (start (vui-instance-region-start row))
+                   (end (vui-instance-region-end row))
+                   (stream-end (vui-stream-handle-region-end s))
+                   (end-position (marker-position end))
+                   (reversed-position (1+ end-position))
+                   (before (vui-snode--buffer)))
+              (set-marker start reversed-position)
+              (expect (vui-rerender row) :to-throw 'error)
+              (expect (vui-snode--buffer) :to-equal before)
+              (expect (marker-position start) :to-equal reversed-position)
+              (expect (marker-position end) :to-equal end-position)
+              (expect (vui-stream-handle-region-end s) :to-be stream-end)
+              (expect (marker-position stream-end) :to-equal end-position)))
+        (vui-snode--kill))))
+
   (it "updates a component node OUT OF ORDER (row no longer last)"
     (let ((vui-render-delay nil)
           (s (vui-make-stream)))
@@ -567,7 +665,7 @@
                       (vui-snode--oracle '("[updated]" "tail") "n1"))))
         (vui-snode--kill))))
 
-  (it "releases nonempty transaction markers after success and failure"
+  (it "releases nonempty transaction and render markers after success and failure"
     (let ((vui-render-delay nil)
           (s (vui-make-stream)))
       (vui-defcomponent vui-snode-transaction-error ()
@@ -585,7 +683,7 @@
                              (push marker markers)
                              marker))))
                 (vui-stream-open-row s (vui-component 'vui-snode-row :label "ok")))
-              (expect (length markers) :to-equal 2)
+              (expect (length markers) :to-equal 3)
               (expect (cl-every (lambda (marker) (not (marker-buffer marker)))
                                 markers)
                       :to-be t))
@@ -600,7 +698,7 @@
                 (expect (vui-stream-open-row
                          s (vui-component 'vui-snode-transaction-error))
                         :to-throw 'error))
-              (expect (length markers) :to-equal 2)
+              (expect (length markers) :to-equal 3)
               (expect (cl-every (lambda (marker) (not (marker-buffer marker)))
                                 markers)
                       :to-be t)))
