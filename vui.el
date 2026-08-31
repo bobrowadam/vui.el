@@ -3624,7 +3624,8 @@ the root re-render commit incrementally (see `vui--commit-root')."
                                       component-name first-render-p)
                       (vui--timing-start)
                       (let ((new-vtree (vui--with-debug-indent
-                                        (funcall render-fn props state))))
+                                        (save-excursion
+                                          (funcall render-fn props state)))))
                         (vui--timing-record 'render component-name)
                         (setf (vui-instance-cached-vtree instance) new-vtree)
                         new-vtree))

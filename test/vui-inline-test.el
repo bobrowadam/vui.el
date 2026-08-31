@@ -136,6 +136,47 @@
         (vui-update instance '(:wide t))
         (expect (char-after) :to-equal ?A))))
 
+  (it "does not let window queries redirect inline output"
+    (let ((vui-render-delay nil)
+          (host (generate-new-buffer " *vui-inline-window-query*"))
+          (other (generate-new-buffer " *vui-inline-other*")))
+      (unwind-protect
+          (save-window-excursion
+            (switch-to-buffer other)
+            (delete-other-windows)
+            (let ((host-window (split-window-right)))
+              (set-window-buffer host-window host)
+              (with-current-buffer host
+                (insert "PREFIX|SUFFIX")
+                (set-window-point host-window (point-max))
+                (vui-defcomponent inline-window-query (label)
+                  :render (progn
+                            (window-font-width host-window)
+                            (vui-text label)))
+                (let ((instance
+                       (vui-mount-inline
+                        (vui-component 'inline-window-query :label "A") 8)))
+                  (expect (buffer-string) :to-equal "PREFIX|ASUFFIX")
+                  (expect (list
+                           (marker-position
+                            (vui-instance-region-start instance))
+                           (marker-position
+                            (vui-instance-region-end instance)))
+                          :to-equal '(8 9))
+                  (set-window-point host-window (point-max))
+                  (vui-update instance '(:label "B"))
+                  (expect (buffer-string) :to-equal "PREFIX|BSUFFIX")
+                  (expect (list
+                           (marker-position
+                            (vui-instance-region-start instance))
+                           (marker-position
+                            (vui-instance-region-end instance)))
+                          :to-equal '(8 9))))))
+        (when (buffer-live-p host)
+          (kill-buffer host))
+        (when (buffer-live-p other)
+          (kill-buffer other)))))
+
   (it "keeps point inside a field across re-renders"
     (with-temp-buffer
       (insert "HOST\n")
