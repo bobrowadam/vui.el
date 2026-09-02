@@ -240,7 +240,37 @@
             (expect (with-current-buffer "*test-inline-full*"
                       vui--inline-instances)
                     :to-be nil))
-        (kill-buffer "*test-inline-full*")))))
+        (kill-buffer "*test-inline-full*"))))
+
+  (it "vui-unmount of a root tears down inline instances"
+    (let ((unmounted nil)
+          (buffer "*test-inline-root-unmount*"))
+      (vui-defcomponent inline-root-victim ()
+        :on-unmount (setq unmounted t)
+        :render (vui-text "[inline]"))
+      (vui-defcomponent inline-root-owner ()
+        :render (vui-text "ROOT"))
+      (let* ((root (vui-mount (vui-component 'inline-root-owner) buffer))
+             (inline
+              (with-current-buffer buffer
+                (goto-char (point-max))
+                (vui-mount-inline (vui-component 'inline-root-victim))))
+             (start (vui-instance-region-start inline))
+             (end (vui-instance-region-end inline)))
+        (unwind-protect
+            (progn
+              (vui-unmount root)
+              (with-current-buffer buffer
+                (let ((inhibit-read-only t))
+                  (insert "REPLACEMENT"))
+                (expect vui--inline-instances :to-be nil)
+                (vui--on-window-size-change nil))
+              (expect unmounted :to-be t)
+              (expect (marker-position start) :to-be nil)
+              (expect (marker-position end) :to-be nil)
+              (expect (vui-instance-buffer inline) :to-be nil))
+          (when (get-buffer buffer)
+            (kill-buffer buffer)))))))
 
 (provide 'vui-inline-test)
 ;;; vui-inline-test.el ends here

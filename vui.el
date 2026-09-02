@@ -7323,6 +7323,12 @@ Returns the unmounted instance, or nil if nothing was mounted."
         (vui--unmount-root instance)
         (when (buffer-live-p buf)
           (with-current-buffer buf
+            ;; Erasing the root buffer also destroys every inline region.
+            ;; Detach those instances while their markers are still valid.
+            (when vui--inline-instances
+              (dolist (inline-instance (copy-sequence vui--inline-instances))
+                (vui--unmount-inline inline-instance))
+              (kill-local-variable 'vui--inline-instances))
             (kill-local-variable 'vui--root-instance)
             ;; Inhibit modification hooks while erasing: a `vui-field' in
             ;; the buffer installs an after-change hook that runs
