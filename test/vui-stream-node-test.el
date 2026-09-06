@@ -418,6 +418,11 @@
       (vui-vstack :indent 2 (vui-stream stream))
     (vui-vstack (vui-stream stream))))
 
+(vui-defcomponent vui-snode-batch-note ()
+  "Expose a state update in a root separate from the stream."
+  :state ((label "old"))
+  :render (vui-text label))
+
 (defvar vui-snode--failing-cleanup-count 0)
 
 (vui-defcomponent vui-snode-failing-cleanup-row ()
@@ -759,6 +764,41 @@
               (expect (vui-snode--buffer)
                       :to-equal (vui-snode--oracle '("[ready]") "n0"))))
         (vui-snode--kill))))
+
+  (it "open-row preserves another root's batch, including nested batches and timers"
+    (dolist (nested '(nil t))
+      (dolist (vui-render-delay '(nil 60))
+        (let* ((s (vui-make-stream))
+               (stream-root (vui-snode--mount s "n0"))
+               (other-root (vui-mount (vui-component 'vui-snode-batch-note)
+                                      "*vui-snode-other*")))
+          (unwind-protect
+              (progn
+                (when vui-render-delay
+                  (vui--schedule-deferred-render-for stream-root))
+                (with-current-buffer "*vui-snode-other*"
+                  (let ((vui--current-instance other-root))
+                    (vui-batch
+                     (vui-set-state :label "new")
+                     (with-current-buffer "*vui-snode*"
+                       (if nested
+                           (vui-batch
+                            (vui-stream-open-row
+                             s (vui-component 'vui-snode-row :label "ready")))
+                         (vui-stream-open-row
+                          s (vui-component 'vui-snode-row :label "ready"))))
+                     (expect (buffer-string) :to-equal "old")
+                     (expect vui--render-pending-p :to-be t)))
+                  (when vui-render-delay
+                    (expect (vui-instance-render-timer other-root) :not :to-be nil)
+                    (vui-flush-sync))
+                  (expect (buffer-string) :to-equal "new"))
+                (expect (vui-instance-render-timer stream-root) :to-be nil)
+                (expect (vui-snode--buffer)
+                        :to-equal (vui-snode--oracle '("[ready]") "n0")))
+            (vui-snode--kill)
+            (when (get-buffer "*vui-snode-other*")
+              (kill-buffer "*vui-snode-other*")))))))
 
   (it "open-row settles a timerless batch before revalidating its root layout"
     (let ((vui-render-delay nil)

@@ -1890,6 +1890,9 @@ instances, each owning a region delimited by its markers.")
 (defvar vui--batch-depth 0
   "Current nesting depth of `vui-batch' calls.")
 
+(defvar vui--batch-root nil
+  "Root whose render is deferred until the outermost `vui-batch' exits.")
+
 (defvar vui--render-pending-p nil
   "Non-nil if a re-render is pending (during batched updates).")
 
@@ -2136,9 +2139,11 @@ Example:
   (vui-batch
     (vui-set-state \\='count (1+ count))
     (vui-set-state \\='name \"Bob\"))"
-  ;; Capture root at start before BODY runs (BODY might switch buffers)
+  ;; Capture the outermost root before BODY runs (it might switch buffers).
   `(let ((vui--batch-depth (1+ vui--batch-depth))
-         (vui--batch-root (vui--get-root-instance)))
+         (vui--batch-root (if (> vui--batch-depth 0)
+                              vui--batch-root
+                            (vui--get-root-instance))))
     (unwind-protect
         (progn ,@body)
       (cl-decf vui--batch-depth)
@@ -6133,18 +6138,23 @@ nonemptiness are deliberately checked separately by `vui--stream-tail-eligible'.
 This is called only after `vui-stream-open-row' has rejected active rendering,
 so each `vui-flush-sync' starts a top-level render rather than queueing a
 recursive one.  A render may itself request another batched update, so settle
-until this root has neither a timer nor an outstanding batch render."
+until this root has neither a timer nor an outstanding batch render.
+Pending work owned by another batch root is left for that batch to finish."
   (when vui--rendering-p
     (error "vui-stream-open-row cannot run during VUI rendering"))
   (let ((iterations 0))
     (while (or (vui-instance-render-timer root)
-               (and (> vui--batch-depth 0) vui--render-pending-p))
+               (and (> vui--batch-depth 0)
+                    (eq root vui--batch-root)
+                    vui--render-pending-p))
       (when (> (cl-incf iterations) vui--rerender-queue-limit)
         (error "VUI stream-row pending work did not settle after %d iterations"
                vui--rerender-queue-limit))
       ;; `vui-flush-sync' cancels a scheduled timer.  Batched changes have no
-      ;; timer yet, so consume their established pending flag before flushing.
-      (when (and (> vui--batch-depth 0) vui--render-pending-p)
+      ;; timer yet; consume their pending flag only when ROOT owns the batch.
+      (when (and (> vui--batch-depth 0)
+                 (eq root vui--batch-root)
+                 vui--render-pending-p)
         (setq vui--render-pending-p nil))
       (let ((vui--root-instance root))
         (vui-flush-sync)))))
