@@ -425,6 +425,27 @@
 
 (defvar vui-snode--failing-cleanup-count 0)
 
+(defvar vui-snode--failed-row-instance nil)
+
+(vui-defcomponent vui-snode-failing-child-row (process)
+  "Own an async process and fail cleanup before it can be cancelled."
+  :render
+  (progn
+    (vui-use-async 'process (lambda (_resolve _reject) process))
+    (vui-use-effect ()
+      (lambda ()
+        (cl-incf vui-snode--failing-cleanup-count)
+        (vui--schedule-deferred-render-for vui-snode--failed-row-instance)
+        (error "child cleanup failed")))
+    (vui-fragment)))
+
+(vui-defcomponent vui-snode-resource-row (process)
+  "Expose the failed row and mount its resource-owning child."
+  :render
+  (progn
+    (setq vui-snode--failed-row-instance vui--current-instance)
+    (vui-component 'vui-snode-failing-child-row :process process)))
+
 (vui-defcomponent vui-snode-failing-cleanup-row ()
   "Render empty after registering a cleanup that signals."
   :render
@@ -876,6 +897,30 @@
                        :to-match "rejects an initially empty component")))
             (expect vui-snode--failing-cleanup-count :to-equal 1)
             (vui-snode--expect-empty-stream-state s state))
+        (vui-snode--kill))))
+
+  (it "cancels child processes and row timers when rollback cleanup fails"
+    (let ((vui-render-delay 60)
+          (s (vui-make-stream))
+          (process (make-pipe-process :name "vui-snode-cleanup" :noquery t)))
+      (setq vui-snode--failing-cleanup-count 0
+            vui-snode--failed-row-instance nil)
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (let ((state (vui-snode--empty-stream-state s)))
+            (expect (process-live-p process) :to-be-truthy)
+            (expect (vui-stream-open-row
+                     s (vui-component 'vui-snode-resource-row :process process))
+                    :to-throw 'error
+                    '("vui-stream-open-row rejects an initially empty component"))
+            (expect vui-snode--failing-cleanup-count :to-equal 1)
+            (expect (process-live-p process) :not :to-be-truthy)
+            (expect (vui-instance-render-timer vui-snode--failed-row-instance)
+                    :to-be nil)
+            (vui-snode--expect-empty-stream-state s state))
+        (when (process-live-p process) (delete-process process))
+        (when vui-snode--failed-row-instance
+          (vui--cancel-render-timer vui-snode--failed-row-instance))
         (vui-snode--kill))))
 
   (it "rolls back a failed row mount after a nonempty stream"

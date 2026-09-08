@@ -6205,7 +6205,15 @@ Pending work owned by another batch root is left for that batch to finish."
          (when end (set-marker end nil))
          (setf (vui-instance-region-start instance) nil
                (vui-instance-region-end instance) nil)
-         (ignore-errors (vui--cleanup-instance-asyncs instance))
+         ;; A child cleanup may have stopped recursive teardown before its
+         ;; processes were cancelled.  Release resources throughout the tree
+         ;; without invoking lifecycle callbacks again.
+         (let ((pending (list instance)))
+           (while pending
+             (let ((current (pop pending)))
+               (ignore-errors (vui--cleanup-instance-asyncs current))
+               (vui--cancel-render-timer current)
+               (setq pending (append (vui-instance-children current) pending)))))
          (vui--detach-instance instance))))))
 
 (defun vui--stream-open-row-delete-region (buffer start end)
