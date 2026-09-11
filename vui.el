@@ -1896,6 +1896,12 @@ instances, each owning a region delimited by its markers.")
 (defvar vui--render-pending-p nil
   "Non-nil if a re-render is pending (during batched updates).")
 
+(defvar vui--stream-open-row-created-instances nil
+  "Instances created by the current `vui-stream-open-row' transaction.")
+
+(defvar vui--stream-open-row-recording-p nil
+  "Non-nil while `vui-stream-open-row' records created instances.")
+
 (defcustom vui-render-delay 0.01
   "Seconds to wait before rendering when using deferred rendering.
 This delay allows multiple state changes to be batched into a single
@@ -3822,16 +3828,20 @@ PARENT; otherwise falls back to a linear scan (identical semantics)."
          (initial-state (if initial-state-fn
                             (funcall initial-state-fn props-with-children)
                           nil)))
-    (vui-instance--create
-     :id (cl-incf vui--instance-counter)
-     :def def
-     :props props-with-children
-     :state initial-state
-     :vnode vnode
-     :parent parent
-     :children nil
-     :buffer (when parent (vui-instance-buffer parent))
-     :mounted-p nil)))
+    (let ((instance
+           (vui-instance--create
+            :id (cl-incf vui--instance-counter)
+            :def def
+            :props props-with-children
+            :state initial-state
+            :vnode vnode
+            :parent parent
+            :children nil
+            :buffer (when parent (vui-instance-buffer parent))
+            :mounted-p nil)))
+      (when vui--stream-open-row-recording-p
+        (push instance vui--stream-open-row-created-instances))
+      instance)))
 
 (defun vui--reconcile-component (vnode parent)
   "Reconcile VNODE with existing child of PARENT, or create new instance."
@@ -6184,37 +6194,65 @@ Pending work owned by another batch root is left for that batch to finish."
     (when last-start
       (set-marker last-start (plist-get snapshot :last-start-position) buffer))))
 
-(defun vui--stream-open-row-discard-inline (instances)
-  "Remove failed inline INSTANCES without masking their original error."
+(defun vui--stream-open-row-release-instances (instances created-instances)
+  "Release failed INSTANCES and partial CREATED-INSTANCES exactly once."
+  (let ((seen (make-hash-table :test 'eq))
+        ordered)
+    (cl-labels ((collect (instance)
+                  (unless (gethash instance seen)
+                    (puthash instance t seen)
+                    (dolist (child (vui-instance-children instance))
+                      (collect child))
+                    (setq ordered (nconc ordered (list instance))))))
+      (dolist (instance instances)
+        (collect instance))
+      ;; A render error can occur before a parent records its new children.
+      (dolist (instance created-instances)
+        (collect instance)))
+    (dolist (instance ordered)
+      ;; Clear callback registrations before invoking user code so recovery
+      ;; cannot invoke a failed cleanup twice.
+      (ignore-errors (vui--cleanup-instance-effects instance))
+      (ignore-errors (vui--cleanup-instance-asyncs instance))
+      (when-let* ((cleanup (vui-instance-mount-cleanup instance)))
+        (setf (vui-instance-mount-cleanup instance) nil)
+        (ignore-errors (funcall cleanup)))
+      (when (vui-instance-mounted-p instance)
+        (setf (vui-instance-mounted-p instance) nil)
+        (let* ((def (vui-instance-def instance))
+               (vui--current-instance instance))
+          (ignore-errors
+            (vui--call-lifecycle-hook
+             "on-unmount" (vui-component-def-on-unmount def) instance
+             (vui-instance-props instance) (vui-instance-state instance)))))
+      ;; Cancel after callbacks because they may schedule another render.
+      (vui--cancel-render-timer instance))
+    ;; Prevent the restoration render from reconciling or unmounting newly
+    ;; created children after their rollback cleanup has already run.
+    (dolist (instance created-instances)
+      (when-let* ((parent (vui-instance-parent instance)))
+        (setf (vui-instance-children parent)
+              (delq instance (vui-instance-children parent)))))
+    (dolist (instance instances)
+      (vui--detach-instance instance))
+    (dolist (instance created-instances)
+      (vui--detach-instance instance))))
+
+(defun vui--stream-open-row-discard-inline (instances created-instances)
+  "Remove failed inline INSTANCES and partial CREATED-INSTANCES."
   (dolist (instance instances)
-    ;; Prefer VUI's normal teardown.  If a user lifecycle callback signals,
-    ;; finish only its physical residue; effect registrations were cleared
-    ;; before their callbacks ran, so this cannot invoke a failed cleanup
-    ;; twice.
-    (condition-case nil
-        (vui--unmount-inline instance)
-      (error
-       (let ((buffer (vui-instance-buffer instance))
-             (start (vui-instance-region-start instance))
-             (end (vui-instance-region-end instance)))
-         (when (buffer-live-p buffer)
-           (with-current-buffer buffer
-             (setq vui--inline-instances (delq instance vui--inline-instances))
-             (vui--stream-open-row-delete-region buffer start end)))
-         (when start (set-marker start nil))
-         (when end (set-marker end nil))
-         (setf (vui-instance-region-start instance) nil
-               (vui-instance-region-end instance) nil)
-         ;; A child cleanup may have stopped recursive teardown before its
-         ;; processes were cancelled.  Release resources throughout the tree
-         ;; without invoking lifecycle callbacks again.
-         (let ((pending (list instance)))
-           (while pending
-             (let ((current (pop pending)))
-               (ignore-errors (vui--cleanup-instance-asyncs current))
-               (vui--cancel-render-timer current)
-               (setq pending (append (vui-instance-children current) pending)))))
-         (vui--detach-instance instance))))))
+    (let ((buffer (vui-instance-buffer instance))
+          (start (vui-instance-region-start instance))
+          (end (vui-instance-region-end instance)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (setq vui--inline-instances (delq instance vui--inline-instances))
+          (vui--stream-open-row-delete-region buffer start end)))
+      (when start (set-marker start nil))
+      (when end (set-marker end nil))
+      (setf (vui-instance-region-start instance) nil
+            (vui-instance-region-end instance) nil)))
+  (vui--stream-open-row-release-instances instances created-instances))
 
 (defun vui--stream-open-row-delete-region (buffer start end)
   "Delete BUFFER's managed region between START and END markers."
@@ -6282,7 +6320,9 @@ empty-stream fallback."
            (transaction-end
             (and transaction-start
                  (copy-marker (marker-position transaction-start) t)))
-           node)
+           node
+           (vui--stream-open-row-created-instances nil)
+           (vui--stream-open-row-recording-p t))
       (unwind-protect
           (condition-case err
               (progn
@@ -6293,7 +6333,12 @@ empty-stream fallback."
                 (let* ((sentinel (vui-text "\u200b"))
                        (root (vui-get-instance buffer)))
                   (push sentinel (vui-stream-handle-items-rev handle))
+                  ;; The stream model changed without changing the cached
+                  ;; vnode.  Force a commit past the unchanged-tree shortcut.
+                  (setf (vui-instance-render-record root) nil)
                   (vui-rerender root)
+                  ;; Rendering the sentinel can change the root's layout.
+                  (vui--stream-open-row-validate handle vnode)
                   (let* ((start (vui-stream-handle-region-start handle))
                          (end (vui-stream-handle-region-end handle))
                          (position (and start (marker-position start))))
@@ -6334,7 +6379,8 @@ empty-stream fallback."
              (let ((new-inline
                     (with-current-buffer buffer
                       (cl-set-difference vui--inline-instances old-inline :test #'eq))))
-               (vui--stream-open-row-discard-inline new-inline))
+               (vui--stream-open-row-discard-inline
+                new-inline vui--stream-open-row-created-instances))
              (if empty-p
                  ;; The sentinel was the only rendered stream item, so restoring
                  ;; the original empty model and re-laying it restores layout.

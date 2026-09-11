@@ -456,6 +456,48 @@
         (error "failing cleanup")))
     (vui-fragment)))
 
+(vui-defcomponent vui-snode-memo-app (stream)
+  "Render STREAM in a memoized supported layout."
+  :memo t
+  :render (vui-vstack (vui-stream stream) (vui-text "note")))
+
+(defvar vui-snode--bootstrap-child-unmounts 0)
+
+(vui-defcomponent vui-snode-bootstrap-child ()
+  "Track teardown of a component created by the bootstrap render."
+  :on-unmount (cl-incf vui-snode--bootstrap-child-unmounts)
+  :render (vui-text "header"))
+
+(vui-defcomponent vui-snode-changing-layout-app (stream)
+  "Move STREAM out of the supported layout after its first item."
+  :render
+  (if (vui-stream-handle-items-rev stream)
+      (vui-vstack (vui-component 'vui-snode-bootstrap-child)
+                  (vui-stream stream)
+                  (vui-text "note"))
+    (vui-vstack (vui-stream stream) (vui-text "note"))))
+
+(defvar vui-snode--partial-child-instance nil)
+
+(vui-defcomponent vui-snode-partial-resource-child (process)
+  "Register PROCESS before a later sibling fails."
+  :render
+  (progn
+    (setq vui-snode--partial-child-instance vui--current-instance)
+    (vui-use-async 'process (lambda (_resolve _reject) process))
+    (vui-text "child")))
+
+(vui-defcomponent vui-snode-partial-failing-child ()
+  "Fail while a sibling remains absent from its parent's child list."
+  :render (error "partial child render failed"))
+
+(vui-defcomponent vui-snode-partial-failing-row (process)
+  "Render a resource-owning child before a failing child."
+  :render
+  (vui-fragment
+   (vui-component 'vui-snode-partial-resource-child :process process)
+   (vui-component 'vui-snode-partial-failing-child)))
+
 (describe "vui-stream nodes: component nodes (open a row)"
   (it "opens a component vnode as a live row node"
     (let ((vui-render-delay nil)
@@ -633,6 +675,57 @@
             (vui-stream-update node (vui-component 'vui-snode-row :label "updated"))
             (expect (vui-snode--buffer)
                     :to-equal (vui-snode--oracle '("[updated]") "n0")))
+        (vui-snode--kill))))
+
+  (it "forces the empty-stream bootstrap through a memoized root"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream)))
+      (vui-mount (vui-component 'vui-snode-memo-app :stream s) "*vui-snode*")
+      (unwind-protect
+          (let ((root (vui-get-instance "*vui-snode*")))
+            ;; Establish the unchanged-tree render record that used to skip
+            ;; the bootstrap commit.
+            (vui-rerender root)
+            (let ((node (vui-stream-open-row
+                         s (vui-component 'vui-snode-row :label "memo"))))
+              (expect (vui--inline-p (vui--stream-node-instance node)) :to-be t)
+              (expect (vui-snode--buffer) :to-equal "[memo]\nnote")))
+        (vui-snode--kill))))
+
+  (it "rejects a layout changed by the empty-stream bootstrap"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream)))
+      (setq vui-snode--bootstrap-child-unmounts 0)
+      (vui-mount (vui-component 'vui-snode-changing-layout-app :stream s)
+                 "*vui-snode*")
+      (unwind-protect
+          (let ((state (vui-snode--empty-stream-state s)))
+            (expect (vui-stream-open-row
+                     s (vui-component 'vui-snode-row :label "bad"))
+                    :to-throw 'error)
+            (expect vui-snode--bootstrap-child-unmounts :to-equal 1)
+            (vui-snode--expect-empty-stream-state s state))
+        (vui-snode--kill))))
+
+  (it "releases partial children when a later child fails to render"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream))
+          (process (make-pipe-process :name "vui-snode-partial-resource"
+                                      :noquery t)))
+      (setq vui-snode--partial-child-instance nil)
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (let ((state (vui-snode--empty-stream-state s)))
+            (expect (vui-stream-open-row
+                     s (vui-component 'vui-snode-partial-failing-row
+                                      :process process))
+                    :to-throw 'error)
+            (expect (process-live-p process) :not :to-be-truthy)
+            (expect (vui-instance-buffer vui-snode--partial-child-instance)
+                    :to-be nil)
+            (vui-snode--expect-empty-stream-state s state))
+        (when (process-live-p process)
+          (delete-process process))
         (vui-snode--kill))))
 
   (it "preserves and updates an empty-stream row after an eligible root refresh"
@@ -896,6 +989,36 @@
                (expect (error-message-string err)
                        :to-match "rejects an initially empty component")))
             (expect vui-snode--failing-cleanup-count :to-equal 1)
+            (vui-snode--expect-empty-stream-state s state))
+        (vui-snode--kill))))
+
+  (it "runs each unmount callback once when a sibling cleanup fails"
+    (let ((vui-render-delay nil)
+          (s (vui-make-stream))
+          (good-unmounts 0)
+          (bad-unmounts 0))
+      (vui-defcomponent vui-snode-good-unmount ()
+        :on-unmount (cl-incf good-unmounts)
+        :render (vui-fragment))
+      (vui-defcomponent vui-snode-bad-cleanup ()
+        :on-unmount (cl-incf bad-unmounts)
+        :render
+        (progn
+          (vui-use-effect () (lambda () (error "cleanup failed")))
+          (vui-fragment)))
+      (vui-defcomponent vui-snode-cleanup-siblings ()
+        :render
+        (vui-fragment
+         (vui-component 'vui-snode-good-unmount)
+         (vui-component 'vui-snode-bad-cleanup)))
+      (vui-snode--mount s "n0")
+      (unwind-protect
+          (let ((state (vui-snode--empty-stream-state s)))
+            (expect (vui-stream-open-row
+                     s (vui-component 'vui-snode-cleanup-siblings))
+                    :to-throw 'error)
+            (expect good-unmounts :to-equal 1)
+            (expect bad-unmounts :to-equal 1)
             (vui-snode--expect-empty-stream-state s state))
         (vui-snode--kill))))
 

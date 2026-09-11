@@ -1267,36 +1267,6 @@ fresh mount starts clean.
  :children (list (vui-component 'risky-component)))
 #+end_src
 
-* Streaming
-
-** vui-stream-open-row
-
-#+begin_src elisp
-(vui-stream-open-row HANDLE COMPONENT-VNODE) -> node
-#+end_src
-
-Append COMPONENT-VNODE as a stateful inline stream row and return its live
-node.  HANDLE must already be mounted and live, and COMPONENT-VNODE must be a
-=vui-component=.  Call this outside component rendering.
-
-Unlike =vui-stream-open=, this function guarantees that the returned node owns
-a nonempty inline component instance even when the stream was empty, but only
-when HANDLE is the first stream in the committed root's stream-tail layout: a
-fragment or an unindented, unfaced, keymap-free =vui-vstack= with no other
-stream.  This is the existing root-commit path that preserves inline rows;
-other layouts signal an error before mutation rather than losing the row on a
-later root refresh.
-
-Before final layout validation, it synchronously settles this root's pending
-render timer or current =vui-batch= update, then finishes its private
-non-component bootstrap before returning.  Thus a stale eligible tree cannot
-admit a row that the pending root commit would destroy, and
-=vui-stream-update= can refresh the returned row immediately.  The requested
-component mounts exactly once and is never rendered through
-=vui-stream-open='s compatibility fallback.  A component with initially empty
-output signals an error and leaves the stream unchanged.  The compatibility
-fallback of =vui-stream-open= is unchanged.
-
 ** vui-reset-error-boundary
 
 #+begin_src elisp
@@ -1306,6 +1276,32 @@ fallback of =vui-stream-open= is unchanged.
 Reset error state for boundary ID, allowing retry. When ID is nil,
 resets every boundary in the current tree. Call it from a component
 callback or with the VUI buffer current.
+
+* Streaming
+
+** vui-stream-open-row
+
+#+begin_src elisp
+(vui-stream-open-row HANDLE COMPONENT-VNODE) -> node
+#+end_src
+
+Append COMPONENT-VNODE as a stateful inline stream row and return its live
+node. HANDLE must already be mounted and live. COMPONENT-VNODE must be a
+=vui-component=. Call this outside component rendering.
+
+The returned node owns a nonempty inline component instance, including when
+the stream was empty. HANDLE must be the first stream in the committed root's
+stream-tail layout. The root must be a fragment or an unindented, unfaced,
+keymap-free =vui-vstack= with no other stream. Other layouts signal an error
+and leave the stream unchanged.
+
+The function settles this root's pending timer or current =vui-batch= update
+before validating the layout. For an empty stream, it commits a private
+non-component bootstrap and validates the resulting layout again. The
+requested component mounts once and never uses =vui-stream-open='s
+empty-stream fallback. An initially empty component signals an error and
+leaves the stream unchanged. The compatibility fallback of
+=vui-stream-open= is unchanged.
 
 * Configuration Variables
 
