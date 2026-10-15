@@ -7394,10 +7394,12 @@ Creates the buffer if it doesn't exist, switches to it."
     (switch-to-buffer buf)
     buf))
 
-(defun vui-mount (component-vnode &optional buffer-name)
+(defun vui-mount (component-vnode &optional buffer-name no-display)
   "Mount a component as root and render to BUFFER-NAME.
 COMPONENT-VNODE should be created with `vui-component'.
-BUFFER-NAME defaults to \"*vui*\".
+BUFFER-NAME defaults to \"*vui*\".  The buffer is shown in the
+selected window unless NO-DISPLAY is non-nil, which leaves every
+window and the current buffer as they were.
 Returns the root instance."
   (let* ((buf-name (or buffer-name "*vui*"))
          (buf (get-buffer-create buf-name))
@@ -7470,7 +7472,8 @@ Returns the root instance."
       ;; Outside the `buffer-undo-list' binding: leave the list empty, as
       ;; `widget-setup' did before the render stopped recording.
       (setq buffer-undo-list nil))
-    (switch-to-buffer buf)
+    (unless no-display
+      (switch-to-buffer buf))
     instance))
 
 (defun vui-mount-inline (component-vnode &optional position)
