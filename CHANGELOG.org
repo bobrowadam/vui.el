@@ -7,6 +7,13 @@ The format is based on [[https://keepachangelog.com/en/1.1.0/][Keep a Changelog]
 
 * Unreleased
 
+** Added
+
+- =vui-mount= takes an optional NO-DISPLAY argument. With it, the
+  root renders into its buffer without showing that buffer, so a
+  background buffer can be prepared without changing any window or
+  the current buffer.
+
 ** Changed
 
 - The items of a =vui-stream= see the context providers around the
