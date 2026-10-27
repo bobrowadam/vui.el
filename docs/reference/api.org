@@ -88,10 +88,11 @@ In =:on-update= and =:should-update= additionally:
 ** vui-mount
 
 #+begin_src elisp
-(vui-mount COMPONENT-VNODE &optional BUFFER-NAME) -> instance
+(vui-mount COMPONENT-VNODE &optional BUFFER-NAME NO-DISPLAY) -> instance
 #+end_src
 
-Mount a component as root and render to a buffer.
+Mount a component as root and render to a buffer, then show that buffer
+in the selected window.
 
 If the buffer already has a mounted instance, it is unmounted first
 (see =vui-unmount=), so the old tree's lifecycle cleanups run before the
@@ -99,6 +100,8 @@ new tree renders.
 
 - COMPONENT-VNODE :: Created with =vui-component=
 - BUFFER-NAME :: String (default ="*vui*"=)
+- NO-DISPLAY :: When non-nil, render without showing the buffer: every
+  window and the current buffer are left as they were
 - Returns :: The root instance
 
 #+begin_src elisp

@@ -14,6 +14,22 @@
 (require 'vui)
 (require 'vui-test-helpers)
 
+(describe "vui-mount"
+  (it "renders without displaying its buffer when NO-DISPLAY is non-nil"
+    (vui-defcomponent hidden-mount ()
+      :render (vui-text "hidden"))
+    (let ((window-buffer (window-buffer (selected-window)))
+          (current (current-buffer)))
+      (vui-mount (vui-component 'hidden-mount) "*test-hidden-mount*" t)
+      (unwind-protect
+          (progn
+            (expect (window-buffer (selected-window)) :to-be window-buffer)
+            (expect (current-buffer) :to-be current)
+            (expect (get-buffer-window "*test-hidden-mount*" t) :to-be nil)
+            (expect (with-current-buffer "*test-hidden-mount*" (buffer-string))
+                    :to-equal "hidden"))
+        (kill-buffer "*test-hidden-mount*")))))
+
 (describe "vui-unmount"
   (it "runs on-unmount hooks for the whole tree, children first"
     (let ((unmount-log nil))

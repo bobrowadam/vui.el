@@ -12161,10 +12161,12 @@ Creates the buffer if it doesn't exist, switches to it."
     (switch-to-buffer buf)
     buf))
 
-(defun vui-mount (component-vnode &optional buffer-name)
+(defun vui-mount (component-vnode &optional buffer-name no-display)
   "Mount a component as root and render to BUFFER-NAME.
 COMPONENT-VNODE should be created with `vui-component'.
-BUFFER-NAME defaults to \"*vui*\".
+BUFFER-NAME defaults to \"*vui*\".  The buffer is shown in the
+selected window unless NO-DISPLAY is non-nil, which leaves every
+window and the current buffer as they were.
 Returns the root instance.
 
 Called from a hook or an effect of a render in progress, the mount
@@ -12183,7 +12185,7 @@ does not show the buffer."
                                     vui-rerender-on-resize-default)))
     ;; A hook of the tree can kill BUF.  Do not show BUF when the mount
     ;; waits for its trees to go: the buffer can be on its way out.
-    (when (and instance (buffer-live-p buf))
+    (when (and instance (not no-display) (buffer-live-p buf))
       (switch-to-buffer buf))
     instance))
 
