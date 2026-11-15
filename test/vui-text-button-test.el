@@ -228,6 +228,22 @@
       ;; "skip" is not tabbable, so we land on "b"
       (expect (button-get (button-at (point)) :vui-tag) :to-equal "b")))
 
+  (it "skips buttons that start in invisible text"
+    ;; Point cannot stay in invisible text: the command loop moves it
+    ;; to the next visible character, so TAB would seem to do nothing.
+    (with-temp-buffer
+      (vui-render (vui-vstack (vui-button "a" :on-click #'ignore)
+                              (vui-button "hidden" :on-click #'ignore)
+                              (vui-button "b" :on-click #'ignore))
+                  (current-buffer))
+      (goto-char (point-min))
+      (search-forward "[hidden]")
+      (let ((inhibit-read-only t))
+        (put-text-property (match-beginning 0) (1+ (point)) 'invisible t))
+      (goto-char (point-min))
+      (vui-forward 1)
+      (expect (button-get (button-at (point)) :vui-tag) :to-equal "b")))
+
   (it "moves backward and wraps"
     (with-temp-buffer
       (vui-render (vui-vstack (vui-button "one" :on-click #'ignore)
@@ -237,6 +253,33 @@
       ;; backward from the first wraps to the last
       (vui-backward 1)
       (expect (button-get (button-at (point)) :vui-tag) :to-equal "two"))))
+
+(describe "a text button the host puts in the text"
+  ;; A host such as a chat buffer puts its own `button.el' buttons in a
+  ;; `vui-text'.  Such a button has no path and no identity, so a render
+  ;; cannot find it again.  Point must stay where it was in the text, not
+  ;; go to the start of the component.
+  (it "keeps point on the button when its component re-renders"
+    (let ((vui-render-delay nil))
+      (vui-defcomponent tb-host-toggle ()
+        :state ((open nil))
+        :render (vui-text
+                 (concat "\nhead\n"
+                         (make-text-button (if open "v toggle" "> toggle") nil
+                                           'action #'ignore)
+                         (if open "\nbody" ""))))
+      (let ((inst (vui-mount (vui-component 'tb-host-toggle) "*tb-host*")))
+        (unwind-protect
+            (with-current-buffer "*tb-host*"
+              (goto-char (point-min))
+              (search-forward "toggle")
+              (goto-char (match-beginning 0))
+              (expect (button-at (point)) :to-be-truthy)
+              (let ((vui--current-instance inst)) (vui-set-state :open t))
+              (expect (buffer-string) :to-equal "\nhead\nv toggle\nbody")
+              (expect (line-number-at-pos) :to-equal 3)
+              (expect (current-column) :to-equal 2))
+          (kill-buffer "*tb-host*"))))))
 
 (describe "navigation keys bound on a button"
   ;; Regression: `button-map' inherits `button-buffer-map', which binds TAB

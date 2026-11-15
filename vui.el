@@ -545,11 +545,15 @@ Triggers a re-render of the mounted component with current state."
 (defun vui--tabable-positions ()
   "Sorted start positions of interactive elements reachable by TAB.
 Elements whose `:vui-tab-order' is -1 are skipped (matching the old
-widget behaviour)."
+widget behaviour), and so are elements that start in invisible text:
+point cannot stay there, and the command loop moves it off the element."
   (sort (delq nil
               (mapcar (lambda (elt)
-                        (unless (eql (vui--elt-get elt :vui-tab-order) -1)
-                          (car (vui-element-bounds elt))))
+                        (let ((start (car (vui-element-bounds elt))))
+                          (and start
+                               (not (eql (vui--elt-get elt :vui-tab-order) -1))
+                               (not (invisible-p start))
+                               start)))
                       (vui--collect-widgets)))
         #'<))
 
@@ -5572,20 +5576,25 @@ point at the end of an editable field (see `vui--field-ending-at', which
 START is passed on to), and :field-text the text of a field (see
 `vui--field-text').  With START and END, :line counts from the
 line of START instead of the first line of the buffer, and :from-end
-to END, so the cost depends on the region, not on where it is."
+to END, so the cost depends on the region, not on where it is.
+
+A text button that the host put in the text (a `button.el' button in
+a `vui-text') has no path and no identity: nothing finds it again, and
+its position is saved as plain text."
   (let* ((field (vui--field-ending-at (point) start))
-         (elt (or field (vui--elt-at (point)))))
-    (if elt
+         (elt (or field (vui--elt-at (point))))
+         (path (and elt (vui--elt-get elt :vui-path)))
+         (identity (and elt (vui--widget-identity elt))))
+    (if (or field path identity)
         (let* ((bounds (vui-element-bounds elt))
                (elt-start (car bounds))
                (offset (if elt-start (- (point) elt-start) 0))
-               (path (vui--elt-get elt :vui-path))
-               (identity (vui--widget-identity elt))
                (label (vui--elt-get elt :vui-tag)))
           (list :path path :identity identity :label label :offset offset
                 :at-end (and field t)
                 :field-text (and (widgetp elt) (vui--field-text elt))))
-      ;; No element at point - save line/column as fallback
+      ;; No element at point that a render can find again - save
+      ;; line/column as fallback
       (list :line (if start
                       ;; Between the starts of the two lines, so every
                       ;; line counted ends with a newline
