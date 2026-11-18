@@ -570,7 +570,10 @@ Interactively, N is the prefix argument."
                                       (lambda (p pt) (> p pt)))
                         len))
                  (idx (mod (+ i (1- n)) len)))
-            (goto-char (nth idx positions))))))))
+            (goto-char (nth idx positions))
+            ;; A stop can follow invisible text.  The command loop would
+            ;; move point off it, as text inserted there would be invisible.
+            (setq disable-point-adjustment t)))))))
 
 (defun vui-backward (&optional n)
   "Move point to the Nth previous interactive element (button or field).
@@ -587,7 +590,8 @@ Movement wraps around the buffer, and a negative N moves forward.  See
                  (below (seq-filter (lambda (p) (< p pt)) positions))
                  (i (if below (1- (length below)) -1))
                  (idx (mod (- i (1- n)) len)))
-            (goto-char (nth idx positions))))))))
+            (goto-char (nth idx positions))
+            (setq disable-point-adjustment t)))))))
 
 (defun vui-field-activate (pos &optional event)
   "Invoke the editable field at POS, also when POS is at its end.
