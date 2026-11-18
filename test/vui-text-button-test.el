@@ -244,6 +244,29 @@
       (vui-forward 1)
       (expect (button-get (button-at (point)) :vui-tag) :to-equal "b")))
 
+  (it "stays on a button that follows invisible text"
+    ;; Text inserted after invisible text would inherit `invisible', so
+    ;; the command loop moves point away from there: back to the start of
+    ;; the invisible text when point moved backward.
+    (let ((buffer (generate-new-buffer "*vui-backtab*")))
+      (unwind-protect
+          (save-window-excursion
+            (switch-to-buffer buffer)
+            (vui-render (vui-vstack (vui-button "a" :on-click #'ignore)
+                                    (vui-text "hidden")
+                                    (vui-button "b" :on-click #'ignore))
+                        buffer)
+            (goto-char (point-min))
+            (search-forward "hidden")
+            (let ((inhibit-read-only t))
+              (put-text-property (match-beginning 0) (1+ (point))
+                                 'invisible t))
+            (goto-char (point-max))
+            (execute-kbd-macro (kbd "<backtab>"))
+            (expect (button-get (button-at (point)) :vui-tag)
+                    :to-equal "b"))
+        (kill-buffer buffer))))
+
   (it "moves backward and wraps"
     (with-temp-buffer
       (vui-render (vui-vstack (vui-button "one" :on-click #'ignore)
